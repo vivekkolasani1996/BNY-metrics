@@ -40,8 +40,6 @@ base_url = "https://your-runai-instance.example.com"
 # Set your preferred output directory
 output_dir = os.getenv('OUTPUT_DIR', '/your/preferred/output/path')
 
-
-
 Parameters
 
 client_id: Your Run:AI API client ID
