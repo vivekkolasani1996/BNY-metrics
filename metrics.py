@@ -38,34 +38,22 @@ class WorkloadMetric(BaseModel):
 
             value = float(granular["value"])
             if not self.is_static_value:
-                total += value * time_diff  # Keep raw sum for average calculation
+                total += value * time_diff
             else:
                 total += value * time_diff
 
             peak = max(peak, value)
             timestamp_prev = granular["timestamp"]
 
-        # Convert to hours and apply conversion factor
         weighted_avg = (total / total_time) if total_time > 0 else 0
         total_hours = total / 3600 * self.conversion_factor
         
         return total_hours, peak, weighted_avg
 
 def get_time_windows(start_date, end_date, desired_resolution=15):
-    """
-    Generate time windows for optimal metric resolution.
-    
-    Args:
-        start_date: datetime object for start
-        end_date: datetime object for end
-        desired_resolution: desired resolution in seconds (default 15s)
-    
-    Returns:
-        List of (window_start, window_end) tuples
-    """
     total_duration = (end_date - start_date).total_seconds()
-    samples_per_window = 1000  # Max samples per API call
-    window_duration = samples_per_window * desired_resolution  # Duration covered by one API call
+    samples_per_window = 1000
+    window_duration = samples_per_window * desired_resolution
     
     windows = []
     current_start = start_date
@@ -77,8 +65,55 @@ def get_time_windows(start_date, end_date, desired_resolution=15):
     
     return windows
 
+def detect_suspicious_patterns(workload, metrics_data, actual_start, actual_duration):
+    suspicious_patterns = []
+    
+    gpu_allocated = metrics_data.get("gpu_allocated", 0)
+    gpu_utilization_peak = metrics_data.get("gpu_utilization_peak", 0)
+    gpu_utilization_avg = metrics_data.get("gpu_utilization_avg", 0)
+    cpu_utilization_avg = metrics_data.get("cpu_utilization_avg", 0)
+    cpu_memory_peak = metrics_data.get("cpu_memory_peak", 0)
+    cpu_memory_avg = metrics_data.get("cpu_memory_avg", 0)
+
+    if gpu_allocated > 0 and gpu_utilization_peak == 0:
+        suspicious_patterns.append({
+            "Project": workload.get('projectName', 'Unknown'),
+            "Department": workload.get('department', 'Unknown'),
+            "Job Name": workload.get('name', 'Unknown'),
+            "Issue Type": "Zero GPU Utilization",
+            "Description": "GPU allocated but no utilization recorded",
+            "Value": f"{gpu_allocated} GPUs",
+            "Timestamp": actual_start,
+            "Duration (Hours)": f"{actual_duration:.2f}"
+        })
+    
+    if cpu_memory_peak > 10 and cpu_memory_avg < (cpu_memory_peak * 0.1):
+        suspicious_patterns.append({
+            "Project": workload.get('projectName', 'Unknown'),
+            "Department": workload.get('department', 'Unknown'),
+            "Job Name": workload.get('name', 'Unknown'),
+            "Issue Type": "Low Memory Utilization",
+            "Description": "High memory allocation with low average usage",
+            "Value": f"Peak: {cpu_memory_peak:.2f}GB, Avg: {cpu_memory_avg:.2f}GB",
+            "Timestamp": actual_start,
+            "Duration (Hours)": f"{actual_duration:.2f}"
+        })
+    
+    if actual_duration > 24 and (gpu_utilization_avg < 10 or cpu_utilization_avg < 10):
+        suspicious_patterns.append({
+            "Project": workload.get('projectName', 'Unknown'),
+            "Department": workload.get('department', 'Unknown'),
+            "Job Name": workload.get('name', 'Unknown'),
+            "Issue Type": "Low Long-term Utilization",
+            "Description": "Long running job with low resource utilization",
+            "Value": f"GPU Util: {gpu_utilization_avg:.2f}%, CPU Util: {cpu_utilization_avg:.2f}%",
+            "Timestamp": actual_start,
+            "Duration (Hours)": f"{actual_duration:.2f}"
+        })
+    
+    return suspicious_patterns
+
 def process_time_window(client, workload_id: str, window_start: datetime, window_end: datetime, metrics_types: list) -> Dict[str, Any]:
-    """Process a single time window for a workload and return the metrics"""
     try:
         metrics_response = client.workloads.workloads.get_workload_metrics(
             workload_id=workload_id,
@@ -93,7 +128,6 @@ def process_time_window(client, workload_id: str, window_start: datetime, window
         return {}
 
 def process_workload(client, workload: dict, start_date: datetime, end_date: datetime, metrics_types: list, metrics_config: dict) -> Dict[str, Any]:
-    """Process a single workload and return its metrics"""
     workload_id = workload.get('id')
     workload_name = workload.get('name', 'Unknown')
     print(f"\nProcessing workload: {workload_name} (ID: {workload_id})")
@@ -101,14 +135,11 @@ def process_workload(client, workload: dict, start_date: datetime, end_date: dat
     if not workload_id:
         return {}
 
-    # Get time windows for optimal resolution
     time_windows = get_time_windows(start_date, end_date)
     print(f"Processing {len(time_windows)} time windows")
 
-    # Calculate optimal number of workers for time window processing
     time_window_workers = max(1, min(10, multiprocessing.cpu_count() * 2))
     
-    # Initialize metrics
     metrics = {
         "gpu_hours": 0.0,
         "gpu_allocated": 0.0,
@@ -125,7 +156,6 @@ def process_workload(client, workload: dict, start_date: datetime, end_date: dat
         "all_measurement_timestamps": []
     }
 
-    # Process time windows in parallel with dynamic worker count
     with concurrent.futures.ThreadPoolExecutor(max_workers=time_window_workers) as executor:
         future_to_window = {
             executor.submit(
@@ -146,7 +176,6 @@ def process_workload(client, workload: dict, start_date: datetime, end_date: dat
                 if not metrics_data.get("measurements"):
                     continue
 
-                # Process measurements
                 for measurement in metrics_data["measurements"]:
                     if not measurement.get("values"):
                         continue
@@ -180,7 +209,6 @@ def process_workload(client, workload: dict, start_date: datetime, end_date: dat
             except Exception as e:
                 print(f"Error processing window {window}: {e}")
 
-    # Calculate actual duration
     if metrics["all_measurement_timestamps"]:
         actual_start = min(metrics["all_measurement_timestamps"])
         actual_end = max(metrics["all_measurement_timestamps"])
@@ -200,12 +228,9 @@ def process_workload(client, workload: dict, start_date: datetime, end_date: dat
     }
 
 def get_response_data(apply_result):
-    """Handle ThreadedApiClient response"""
     try:
-        # Unwrap the ApplyResult object
         response = apply_result.get()
         data = response.data
-        # The unwrapped response should be a dictionary
         if not isinstance(data, dict):
             print(f"Unexpected response data type: {type(data)}")
             return {}
@@ -215,7 +240,6 @@ def get_response_data(apply_result):
         return {}
 
 def fetch_departments(client):
-    """Fetch existing departments"""
     try:
         response = client.organizations.departments.get_departments()
         data = get_response_data(response)
@@ -227,14 +251,11 @@ def fetch_departments(client):
         return []
 
 def fetch_projects_with_departments(client):
-    """Fetch projects and correctly map them to departments using parent relationship"""
     try:
-        # First fetch departments to build a department ID lookup
         departments_response = client.organizations.departments.get_departments()
         departments_data = get_response_data(departments_response)
         departments = departments_data.get('departments', [])
         
-        # Create department ID to name mapping
         department_id_to_name = {}
         for dept in departments:
             dept_id = dept.get('id')
@@ -244,28 +265,23 @@ def fetch_projects_with_departments(client):
         
         print(f"Department ID mapping: {department_id_to_name}")
         
-        # Now fetch projects
         try:
             response = client.projects.get_projects()
             data = get_response_data(response)
         except AttributeError:
-            # If first attempt fails, try alternative endpoint structure
             response = client.organizations.projects.get_projects()
             data = get_response_data(response)
         
         projects = data.get('projects', [])
         print(f"Total Projects Found: {len(projects)}")
         
-        # Create project-to-department mapping using parentId to look up department
         project_to_department = {}
         for project in projects:
             project_name = project.get('name', 'Unknown')
             parent_id = project.get('parentId')
             
-            # Try to get department name from parent relationship
             if parent_id and parent_id in department_id_to_name:
                 department_name = department_id_to_name[parent_id]
-            # If parent info is available in project data
             elif project.get('parent', {}).get('name'):
                 department_name = project.get('parent', {}).get('name')
             else:
@@ -275,10 +291,8 @@ def fetch_projects_with_departments(client):
         
         print("Project-Department Mapping: ", project_to_department)
         
-        # Show the projects with departments in a friendly format
         print("\nProjects Data:")
         for project_name, department in project_to_department.items():
-            # Find the corresponding project object to get GPU quota
             project_obj = next((p for p in projects if p.get('name') == project_name), None)
             gpu_quota = 'Unknown'
             if project_obj and 'totalResources' in project_obj:
@@ -293,50 +307,33 @@ def fetch_projects_with_departments(client):
         return {}, []
 
 def main():
-    # Get environment variables with defaults
-    client_id = "test"
-    client_secret = "8GKmEZUywke3I2pZ3caAjBHXm4gIIorU"
-    base_url = "https://vivek-test.runailabs-cs.com"
-    output_dir = os.getenv('OUTPUT_DIR', '/workspace')
+    client_id = os.getenv("CLIENT_ID", "test")
+    client_secret = os.getenv("CLIENT_SECRET", "DSRZ8cBEtf2zPKa508KUCYwYwQTSUUgi")
+    base_url = os.getenv("BASE_URL", "https://vivek-test.runailabs-cs.com")
+    output_dir = os.getenv("OUTPUT_DIR", "/workspace")
 
     if not all([client_id, client_secret, base_url]):
-        raise ValueError("Missing required environment variables: CLIENT_ID, CLIENT_SECRET, and BASE_URL must be set")
+        raise ValueError("Missing required environment variables")
 
-    # Initialize Run:AI client with SSL verification disabled
     config = Configuration(
         client_id=client_id,
         client_secret=client_secret,
         runai_base_url=base_url,
-        verify_ssl=False  # Disable SSL certificate verification
+        verify_ssl=False
     )
 
     client = RunaiClient(ThreadedApiClient(config))
 
-    # Use the improved function to get proper project-department mapping
+    # Get project-department mapping
     project_to_department, projects_data = fetch_projects_with_departments(client)
-    
-    # If no projects were found, show a message
     if not project_to_department:
-        print("No project data found.")
+        print("No project-department mapping found.")
         return
 
-    # Prompt user for start and end days of the month
-    year = input("Enter the year (e.g., 2025): ")
-    month = input("Enter the month (1-12): ")
-    start_day = input("Enter the start day of the month: ")
-    end_day = input("Enter the end day of the month: ")
-
-    # Create datetime objects
-    start_date = datetime.datetime(int(year), int(month), int(start_day), tzinfo=datetime.timezone.utc)
-    end_date = datetime.datetime(int(year), int(month), int(end_day), tzinfo=datetime.timezone.utc)
-
-    if start_date >= end_date:
-        print("Start date must be before end date.")
-        return
-
+    end_date = datetime.datetime.now(datetime.timezone.utc)
+    start_date = end_date - datetime.timedelta(days=7)
     print(f"Analyzing data from {start_date.isoformat()} to {end_date.isoformat()}")
 
-    # Fetch workloads data
     try:
         response = client.workloads.workloads.get_workloads()
         response_data = get_response_data(response)
@@ -346,42 +343,9 @@ def main():
         print(f"Error fetching workloads: {e}")
         return
 
-    # Print workload data
-    print("\nWorkloads Data:")
-    for workload in workloads_data:
-        print(f"Workload Name: {workload.get('name', 'Unknown')}")
-        print(f"Project Name: {workload.get('projectName', 'Unknown')}")
-        # Use our project-department mapping to add department info
-        project_name = workload.get('projectName', 'Unknown')
-        department = project_to_department.get(project_name, 'Unknown')
-        print(f"Department: {department}")
-        print("-" * 50)
-
-    # Format dates for default filenames
     date_format = "%m-%d-%y"
     start_str = start_date.strftime(date_format)
     end_str = end_date.strftime(date_format)
-
-    # Allow user to customize filenames
-    print("\nDefault output filenames will be based on the date range.")
-    print(f"Default allocation file: project_allocations_{start_str}_to_{end_str}.csv")
-    print(f"Default utilization file: utilization_metrics_{start_str}_to_{end_str}.csv")
-    
-    custom_allocation_filename = input("\nEnter custom name for allocation file (or press Enter for default): ")
-    custom_utilization_filename = input("Enter custom name for utilization file (or press Enter for default): ")
-    
-    # Set final filenames
-    allocation_filename = os.path.join(output_dir, custom_allocation_filename if custom_allocation_filename else f"project_allocations_{start_str}_to_{end_str}.csv")
-    utilization_filename = os.path.join(output_dir, custom_utilization_filename if custom_utilization_filename else f"utilization_metrics_{start_str}_to_{end_str}.csv")
-
-    # Ensure filenames have .csv extension
-    if not allocation_filename.endswith('.csv'):
-        allocation_filename += '.csv'
-    if not utilization_filename.endswith('.csv'):
-        utilization_filename += '.csv'
-
-    # Ensure output directory exists
-    os.makedirs(output_dir, exist_ok=True)
 
     metrics_types = [
         "GPU_ALLOCATION",
@@ -401,7 +365,12 @@ def main():
         "GPU_MEMORY_USAGE_BYTES": WorkloadMetric(type="GPU_MEMORY_USAGE_BYTES", conversion_factor=1/(1024**3)),
     }
 
-    # Define headers
+    allocation_filename = os.path.join(output_dir, f"project_allocations_{start_str}_to_{end_str}.csv")
+    utilization_filename = os.path.join(output_dir, f"utilization_metrics_{start_str}_to_{end_str}.csv")
+    suspicious_filename = os.path.join(output_dir, f"suspicious_metrics_{start_str}_to_{end_str}.csv")
+
+    os.makedirs(output_dir, exist_ok=True)
+
     allocation_headers = [
         "Department",
         "Project",
@@ -431,12 +400,22 @@ def main():
         "CPU Memory (GB) - Average"
     ]
 
-    project_data = {}
+    suspicious_headers = [
+        "Department",
+        "Project",
+        "Job Name",
+        "Issue Type",
+        "Description",
+        "Value",
+        "Timestamp",
+        "Duration (Hours)"
+    ]
 
-    # Calculate optimal number of workers for workload processing
+    project_data = {}
+    suspicious_data = []
+
     workload_workers = max(1, min(5, multiprocessing.cpu_count()))
 
-    # Process workloads in parallel with dynamic worker count
     with concurrent.futures.ThreadPoolExecutor(max_workers=workload_workers) as executor:
         future_to_workload = {
             executor.submit(
@@ -451,15 +430,17 @@ def main():
             for workload in workloads_data
         }
 
-        # Open CSV files
         with open(allocation_filename, 'w', newline='') as alloc_file, \
-             open(utilization_filename, 'w', newline='') as util_file:
+             open(utilization_filename, 'w', newline='') as util_file, \
+             open(suspicious_filename, 'w', newline='') as susp_file:
             
             alloc_writer = csv.DictWriter(alloc_file, fieldnames=allocation_headers)
             util_writer = csv.DictWriter(util_file, fieldnames=utilization_headers)
+            susp_writer = csv.DictWriter(susp_file, fieldnames=suspicious_headers)
             
             alloc_writer.writeheader()
             util_writer.writeheader()
+            susp_writer.writeheader()
 
             for future in concurrent.futures.as_completed(future_to_workload):
                 workload = future_to_workload[future]
@@ -470,8 +451,6 @@ def main():
 
                     workload = result["workload"]
                     metrics = result["metrics"]
-
-                    # Get project name and department from mapping
                     project_name = workload.get('projectName', 'Unknown')
                     department = project_to_department.get(project_name, 'Unknown')
 
@@ -493,7 +472,7 @@ def main():
                         "CPU Memory (GB) - Average": f"{metrics['cpu_memory_avg']:.2f}"
                     })
 
-                    # Process project data
+                    # Update project data
                     if project_name not in project_data:
                         project_data[project_name] = {
                             "Department": department,
@@ -518,21 +497,29 @@ def main():
                     pd["CPU (# Cores) - Avg"] = (pd["CPU (# Cores) - Avg"] * pd["count"] + metrics["cpu_utilization_avg"]) / (pd["count"] + 1)
                     pd["count"] += 1
 
+                    # Check for suspicious patterns
+                    suspicious_patterns = detect_suspicious_patterns(
+                        workload, metrics, metrics["actual_start"], metrics["actual_duration"]
+                    )
+                    for pattern in suspicious_patterns:
+                        pattern["Department"] = department
+                        susp_writer.writerow(pattern)
+
                 except Exception as e:
                     print(f"Error processing workload {workload.get('name', 'Unknown')}: {e}")
 
             # Write aggregated project data
             for project_name, data in project_data.items():
                 row_data = data.copy()
-                del row_data["count"]  # Remove the counter before writing
+                del row_data["count"]
                 for key in row_data:
                     if isinstance(row_data[key], (int, float)):
                         row_data[key] = f"{float(row_data[key]):.2f}"
                 alloc_writer.writerow(row_data)
 
-    print(f"\nProject allocations have been written to: {allocation_filename}")
-    print(f"Utilization metrics have been written to: {utilization_filename}")
-    print("\nNote: SSL certificate verification has been disabled.")
+    print(f"\nProject allocations written to: {allocation_filename}")
+    print(f"Utilization metrics written to: {utilization_filename}")
+    print(f"Suspicious metrics written to: {suspicious_filename}")
 
 if __name__ == "__main__":
     main()
