@@ -1,4 +1,4 @@
-# BNY-metrics
+# metrics
 
 Run:AI Resource Usage Report Generator
 This script generates reports about resource utilization across projects and departments in a Run:AI environment. It extracts metrics about GPU allocation, CPU usage, and memory utilization, organizing them by project and department.
